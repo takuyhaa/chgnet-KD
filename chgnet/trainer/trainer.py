@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import csv
 import random
 import shutil
 import time
@@ -19,7 +20,7 @@ from torch.optim.lr_scheduler import (
 )
 
 from chgnet.model.model import CHGNet
-from chgnet.utils import AverageMeter, determine_device, mae, write_json
+from chgnet.utils import AverageMeter, cuda_devices_sorted_by_free_mem, mae, write_json
 
 if TYPE_CHECKING:
     from torch.utils.data import DataLoader
@@ -32,11 +33,12 @@ class Trainer:
 
     def __init__(
         self,
-        model: CHGNet | None = None,
-        *,
+        model: nn.Module | None = None,
         targets: TrainTask = "ef",
         energy_loss_ratio: float = 1,
         force_loss_ratio: float = 1,
+        soft_energy_loss_ratio: float = 1,
+        soft_force_loss_ratio: float = 1,
         stress_loss_ratio: float = 0.1,
         mag_loss_ratio: float = 0.1,
         optimizer: str = "Adam",
@@ -49,14 +51,13 @@ class Trainer:
         torch_seed: int | None = None,
         data_seed: int | None = None,
         use_device: str | None = None,
-        check_cuda_mem: bool = True,
         **kwargs,
     ) -> None:
         """Initialize all hyper-parameters for trainer.
 
         Args:
             model (nn.Module): a CHGNet model
-            targets ("ef" | "efs" | "efsm"): The training targets. Default = "ef"
+            targets ("ef" | "efs" | "efsm" | "efgh"): The training targets. Default = "ef"
             energy_loss_ratio (float): energy loss ratio in loss function
                 Default = 1
             force_loss_ratio (float): force loss ratio in loss function
@@ -82,19 +83,16 @@ class Trainer:
                 Default = None
             data_seed (int): random seed for random
                 Default = None
-            use_device (str, optional): The device to be used for predictions,
-                either "cpu", "cuda", or "mps". If not specified, the default device is
-                automatically selected based on the available options.
+            use_device (str, optional): device name to train the CHGNet.
+                Can be "cuda", "cpu"
                 Default = None
-            check_cuda_mem (bool): Whether to use cuda with most available memory
-                Default = True
             **kwargs (dict): additional hyper-params for optimizer, scheduler, etc.
         """
         # Store trainer args for reproducibility
         self.trainer_args = {
             k: v
             for k, v in locals().items()
-            if k not in {"self", "__class__", "model", "kwargs"}
+            if k not in ["self", "__class__", "model", "kwargs"]
         }
         self.trainer_args.update(kwargs)
 
@@ -133,7 +131,7 @@ class Trainer:
             )
 
         # Define learning rate scheduler
-        if scheduler in {"MultiStepLR", "multistep"}:
+        if scheduler in ["MultiStepLR", "multistep"]:
             scheduler_params = kwargs.pop(
                 "scheduler_params",
                 {
@@ -143,11 +141,11 @@ class Trainer:
             )
             self.scheduler = MultiStepLR(self.optimizer, **scheduler_params)
             self.scheduler_type = "multistep"
-        elif scheduler in {"ExponentialLR", "Exp", "Exponential"}:
+        elif scheduler in ["ExponentialLR", "Exp", "Exponential"]:
             scheduler_params = kwargs.pop("scheduler_params", {"gamma": 0.98})
             self.scheduler = ExponentialLR(self.optimizer, **scheduler_params)
             self.scheduler_type = "exp"
-        elif scheduler in {"CosineAnnealingLR", "CosLR", "Cos", "cos"}:
+        elif scheduler in ["CosineAnnealingLR", "CosLR", "Cos", "cos"]:
             scheduler_params = kwargs.pop("scheduler_params", {"decay_fraction": 1e-2})
             decay_fraction = scheduler_params.pop("decay_fraction")
             self.scheduler = CosineAnnealingLR(
@@ -177,6 +175,8 @@ class Trainer:
             is_intensive=self.model.is_intensive,
             energy_loss_ratio=energy_loss_ratio,
             force_loss_ratio=force_loss_ratio,
+            soft_energy_loss_ratio=soft_energy_loss_ratio,
+            soft_force_loss_ratio=soft_force_loss_ratio,
             stress_loss_ratio=stress_loss_ratio,
             mag_loss_ratio=mag_loss_ratio,
             **kwargs,
@@ -185,9 +185,16 @@ class Trainer:
         self.starting_epoch = starting_epoch
 
         # Determine the device to use
-        self.device = determine_device(
-            use_device=use_device, check_cuda_mem=check_cuda_mem
-        )
+        if use_device is not None:
+            self.device = use_device
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        else:
+            self.device = "cpu"
+        if self.device == "cuda":
+            # Determine cuda device with most available memory
+            device_with_most_available_memory = cuda_devices_sorted_by_free_mem()[0]
+            self.device = f"cuda:{device_with_most_available_memory}"
 
         self.print_freq = print_freq
         self.training_history: dict[
@@ -200,7 +207,6 @@ class Trainer:
         train_loader: DataLoader,
         val_loader: DataLoader,
         test_loader: DataLoader | None = None,
-        *,
         save_dir: str | None = None,
         save_test_result: bool = False,
         train_composition_model: bool = False,
@@ -229,6 +235,7 @@ class Trainer:
         if save_dir is None:
             save_dir = f"{datetime.now():%m-%d-%Y}"
         os.makedirs(save_dir, exist_ok=True)
+        self.save_dir = save_dir
 
         print(f"Begin Training: using {self.device} device")
         print(f"training targets: {self.targets}")
@@ -237,6 +244,13 @@ class Trainer:
         # Turn composition model training on / off
         for param in self.model.composition_model.parameters():
             param.requires_grad = train_composition_model
+
+        csv_file = os.path.join(self.save_dir, 'training_log.csv')
+        # CSVファイルのヘッダーを書き込む
+        with open(csv_file, mode="w", newline="") as file:
+            writer = csv.writer(file)
+            header = ["Epoch", "Batch", "Time", "Data Time", "Loss"]+[f'MAE_{key}' for key in self.targets]
+            writer.writerow(header)
 
         for epoch in range(self.starting_epoch, self.epochs):
             # train
@@ -262,8 +276,7 @@ class Trainer:
             print("---------Evaluate Model on Test Set---------------")
             for file in os.listdir(save_dir):
                 if file.startswith("bestE_"):
-                    test_file = file
-                    best_checkpoint = torch.load(os.path.join(save_dir, test_file))
+                    best_checkpoint = torch.load(os.path.join(save_dir, file))
 
             self.model.load_state_dict(best_checkpoint["model"]["state_dict"])
             if save_test_result:
@@ -274,10 +287,7 @@ class Trainer:
                 test_mae = self._validate(
                     test_loader, is_test=True, test_result_save_path=None
                 )
-
-            for key in self.targets:
-                self.training_history[key]["test"] = test_mae[key]
-            self.save(filename=os.path.join(save_dir, test_file))
+            self.training_history[key]["test"] = [test_mae[key] for key in self.targets]
 
     def _train(self, train_loader: DataLoader, current_epoch: int) -> dict:
         """Train all data for one epoch.
@@ -300,6 +310,7 @@ class Trainer:
         self.model.train()
 
         start = time.perf_counter()  # start timer
+        
         for idx, (graphs, targets) in enumerate(train_loader):
             # measure data loading time
             data_time.update(time.perf_counter() - start)
@@ -314,6 +325,10 @@ class Trainer:
             # compute output
             prediction = self.model(graphs, task=self.targets)
             combined_loss = self.criterion(targets, prediction)
+            # Taniguchi inserted
+            # alpha = 0.5
+            # combined_loss = (alpha * self.criterion(targets, prediction)
+            #                  + (1-alpha)*self.criterion(parent_nnp, prediction))
 
             losses.update(combined_loss["loss"].data.cpu().item(), len(graphs))
             for key in self.targets:
@@ -339,23 +354,37 @@ class Trainer:
             batch_time.update(time.perf_counter() - start)
             start = time.perf_counter()
 
+            
             if idx == 0 or (idx + 1) % self.print_freq == 0:
                 message = (
                     f"Epoch: [{current_epoch}][{idx + 1}/{len(train_loader)}] | "
                     f"Time ({batch_time.avg:.3f})({data_time.avg:.3f}) | "
                     f"Loss {losses.val:.4f}({losses.avg:.4f}) | MAE "
                 )
+                csv_row = [
+                    current_epoch,
+                    f"{idx + 1}/{len(train_loader)}",
+                    f"{batch_time.avg:.3f}",
+                    f"{data_time.avg:.3f}",
+                    f"{losses.avg:.4f}",
+                ]
                 for key in self.targets:
                     message += (
                         f"{key} {mae_errors[key].val:.3f}({mae_errors[key].avg:.3f})  "
                     )
+                    csv_row.append(f"{mae_errors[key].avg:.3f}")
                 print(message)
+                # CSVファイルに行を追加
+
+                csv_file = os.path.join(self.save_dir, 'training_log.csv')
+                with open(csv_file, mode="a", newline="") as file:
+                    writer = csv.writer(file)
+                    writer.writerow(csv_row)
         return {key: round(err.avg, 6) for key, err in mae_errors.items()}
 
     def _validate(
         self,
         val_loader: DataLoader,
-        *,
         is_test: bool = False,
         test_result_save_path: str | None = None,
     ) -> dict:
@@ -382,11 +411,11 @@ class Trainer:
             test_pred = []
 
         end = time.perf_counter()
-        for ii, (graphs, targets) in enumerate(val_loader):
+        for idx, (graphs, targets) in enumerate(val_loader):
             if "f" in self.targets or "s" in self.targets:
-                for graph in graphs:
+                for g in graphs:
                     requires_force = "f" in self.targets
-                    graph.atom_frac_coord.requires_grad = requires_force
+                    g.atom_frac_coord.requires_grad = requires_force
                 graphs = [g.to(self.device) for g in graphs]
                 targets = {k: self.move_to(v, self.device) for k, v in targets.items()}
             else:
@@ -407,33 +436,33 @@ class Trainer:
                     combined_loss[f"{key}_MAE_size"],
                 )
             if is_test and test_result_save_path:
-                for jj, graph_i in enumerate(graphs):
+                for idx, graph_i in enumerate(graphs):
                     tmp = {
                         "mp_id": graph_i.mp_id,
                         "graph_id": graph_i.graph_id,
                         "energy": {
-                            "ground_truth": targets["e"][jj].cpu().detach().tolist(),
-                            "prediction": prediction["e"][jj].cpu().detach().tolist(),
+                            "ground_truth": targets["e"][idx].cpu().detach().tolist(),
+                            "prediction": prediction["e"][idx].cpu().detach().tolist(),
                         },
                     }
                     if "f" in self.targets:
                         tmp["force"] = {
-                            "ground_truth": targets["f"][jj].cpu().detach().tolist(),
-                            "prediction": prediction["f"][jj].cpu().detach().tolist(),
+                            "ground_truth": targets["f"][idx].cpu().detach().tolist(),
+                            "prediction": prediction["f"][idx].cpu().detach().tolist(),
                         }
                     if "s" in self.targets:
                         tmp["stress"] = {
-                            "ground_truth": targets["s"][jj].cpu().detach().tolist(),
-                            "prediction": prediction["s"][jj].cpu().detach().tolist(),
+                            "ground_truth": targets["s"][idx].cpu().detach().tolist(),
+                            "prediction": prediction["s"][idx].cpu().detach().tolist(),
                         }
                     if "m" in self.targets:
-                        if targets["m"][jj] is not None:
-                            m_ground_truth = targets["m"][jj].cpu().detach().tolist()
+                        if targets["m"][idx] is not None:
+                            m_ground_truth = targets["m"][idx].cpu().detach().tolist()
                         else:
                             m_ground_truth = None
                         tmp["mag"] = {
                             "ground_truth": m_ground_truth,
-                            "prediction": prediction["m"][jj].cpu().detach().tolist(),
+                            "prediction": prediction["m"][idx].cpu().detach().tolist(),
                         }
                     test_pred.append(tmp)
 
@@ -445,10 +474,10 @@ class Trainer:
             batch_time.update(time.perf_counter() - end)
             end = time.perf_counter()
 
-            if (ii + 1) % self.print_freq == 0:
+            if (idx + 1) % self.print_freq == 0:
                 name = "Test" if is_test else "Val"
                 message = (
-                    f"{name}: [{ii + 1}/{len(val_loader)}] | "
+                    f"{name}: [{idx + 1}/{len(val_loader)}] | "
                     f"Time ({batch_time.avg:.3f}) | "
                     f"Loss {losses.val:.4f}({losses.avg:.4f}) | MAE "
                 )
@@ -471,20 +500,20 @@ class Trainer:
         print(message)
         return {k: round(mae_error.avg, 6) for k, mae_error in mae_errors.items()}
 
-    def get_best_model(self) -> CHGNet:
+    def get_best_model(self):
         """Get best model recorded in the trainer."""
         if self.best_model is None:
             raise RuntimeError("the model needs to be trained first")
-        MAE = min(self.training_history["e"]["val"])  # noqa: N806
+        MAE = min(self.training_history["e"]["val"])
         print(f"Best model has val {MAE =:.4}")
         return self.best_model
 
     @property
-    def _init_keys(self) -> list[str]:
+    def _init_keys(self):
         return [
             key
             for key in list(inspect.signature(Trainer.__init__).parameters)
-            if key not in {"self", "model", "kwargs"}
+            if key not in (["self", "model", "kwargs"])
         ]
 
     def save(self, filename: str = "training_result.pth.tar") -> None:
@@ -575,12 +604,13 @@ class CombinedLoss(nn.Module):
 
     def __init__(
         self,
-        *,
         target_str: str = "ef",
         criterion: str = "MSE",
         is_intensive: bool = True,
         energy_loss_ratio: float = 1,
         force_loss_ratio: float = 1,
+        soft_energy_loss_ratio: float = 1,
+        soft_force_loss_ratio: float = 1,
         stress_loss_ratio: float = 0.1,
         mag_loss_ratio: float = 0.1,
         delta: float = 0.1,
@@ -606,9 +636,9 @@ class CombinedLoss(nn.Module):
         """
         super().__init__()
         # Define loss criterion
-        if criterion in {"MSE", "mse"}:
+        if criterion in ["MSE", "mse"]:
             self.criterion = nn.MSELoss()
-        elif criterion in {"MAE", "mae", "l1"}:
+        elif criterion in ["MAE", "mae", "l1"]:
             self.criterion = nn.L1Loss()
         elif criterion == "Huber":
             self.criterion = nn.HuberLoss(delta=delta)
@@ -621,6 +651,14 @@ class CombinedLoss(nn.Module):
             self.force_loss_ratio = 0
         else:
             self.force_loss_ratio = force_loss_ratio
+        if "g" not in self.target_str:
+            self.soft_energy_loss_ratio = 0
+        else:
+            self.soft_energy_loss_ratio = soft_energy_loss_ratio
+        if "h" not in self.target_str:
+            self.soft_force_loss_ratio = 0
+        else:
+            self.soft_force_loss_ratio = soft_force_loss_ratio
         if "s" not in self.target_str:
             self.stress_loss_ratio = 0
         else:
@@ -648,7 +686,7 @@ class CombinedLoss(nn.Module):
         """
         out = {"loss": 0.0}
         # Energy
-        if "e" in targets:
+        if self.energy_loss_ratio != 0 and "e" in targets:
             if self.is_intensive:
                 out["loss"] += self.energy_loss_ratio * self.criterion(
                     targets["e"], prediction["e"]
@@ -658,14 +696,12 @@ class CombinedLoss(nn.Module):
             else:
                 e_per_atom_target = targets["e"] / prediction["atoms_per_graph"]
                 e_per_atom_pred = prediction["e"] / prediction["atoms_per_graph"]
-                out["loss"] += self.energy_loss_ratio * self.criterion(
-                    e_per_atom_target, e_per_atom_pred
-                )
+                out["loss"] += self.criterion(e_per_atom_target, e_per_atom_pred)
                 out["e_MAE"] = mae(e_per_atom_target, e_per_atom_pred)
                 out["e_MAE_size"] = prediction["e"].shape[0]
 
         # Force
-        if "f" in targets:
+        if self.force_loss_ratio != 0 and "f" in targets:
             forces_pred = torch.cat(prediction["f"], dim=0)
             forces_target = torch.cat(targets["f"], dim=0)
             out["loss"] += self.force_loss_ratio * self.criterion(
@@ -674,8 +710,33 @@ class CombinedLoss(nn.Module):
             out["f_MAE"] = mae(forces_target, forces_pred)
             out["f_MAE_size"] = forces_target.shape[0]
 
+        # Soft_Energy
+        if self.soft_energy_loss_ratio != 0 and "g" in targets:
+            if self.is_intensive:
+                out["loss"] += self.soft_energy_loss_ratio * self.criterion(
+                    targets["g"], prediction["e"]
+                )
+                out["g_MAE"] = mae(targets["g"], prediction["e"])
+                out["g_MAE_size"] = prediction["e"].shape[0]
+            else:
+                g_per_atom_target = targets["g"] / prediction["atoms_per_graph"]
+                e_per_atom_pred = prediction["e"] / prediction["atoms_per_graph"]
+                out["loss"] += self.criterion(g_per_atom_target, e_per_atom_pred)
+                out["g_MAE"] = mae(g_per_atom_target, e_per_atom_pred)
+                out["g_MAE_size"] = prediction["e"].shape[0]
+
+        # Soft_Force
+        if self.soft_force_loss_ratio != 0 and "h" in targets:
+            forces_pred = torch.cat(prediction["f"], dim=0)
+            soft_forces_target = torch.cat(targets["h"], dim=0)
+            out["loss"] += self.soft_force_loss_ratio * self.criterion(
+                soft_forces_target, forces_pred
+            )
+            out["h_MAE"] = mae(soft_forces_target, forces_pred)
+            out["h_MAE_size"] = soft_forces_target.shape[0]
+
         # Stress
-        if "s" in targets:
+        if self.stress_loss_ratio != 0 and "s" in targets:
             stress_pred = torch.cat(prediction["s"], dim=0)
             stress_target = torch.cat(targets["s"], dim=0)
             out["loss"] += self.stress_loss_ratio * self.criterion(
@@ -685,15 +746,15 @@ class CombinedLoss(nn.Module):
             out["s_MAE_size"] = stress_target.shape[0]
 
         # Mag
-        if "m" in targets:
+        if self.mag_loss_ratio != 0 and "m" in targets:
             mag_preds, mag_targets = [], []
-            m_mae_size = 0
+            m_MAE_size = 0
             for mag_pred, mag_target in zip(prediction["m"], targets["m"]):
                 # exclude structures without magmom labels
                 if mag_target is not None:
                     mag_preds.append(mag_pred)
                     mag_targets.append(mag_target)
-                    m_mae_size += mag_target.shape[0]
+                    m_MAE_size += mag_target.shape[0]
             if mag_targets != []:
                 mag_preds = torch.cat(mag_preds, dim=0)
                 mag_targets = torch.cat(mag_targets, dim=0)
@@ -701,9 +762,9 @@ class CombinedLoss(nn.Module):
                     mag_targets, mag_preds
                 )
                 out["m_MAE"] = mae(mag_targets, mag_preds)
-                out["m_MAE_size"] = m_mae_size
+                out["m_MAE_size"] = m_MAE_size
             else:
                 out["m_MAE"] = torch.zeros([1])
-                out["m_MAE_size"] = m_mae_size
+                out["m_MAE_size"] = m_MAE_size
 
         return out
